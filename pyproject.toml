@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-fiori-workflow"
+version = "0.1.0"
+description = "MCP server para gestionar Flexible Workflows de SAP S/4HANA vía OData (app F2190)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Ilan Morales", email = "" }
+]
+keywords = ["sap", "fiori", "workflow", "mcp", "s4hana", "odata"]
+dependencies = [
+  "mcp[cli]>=1.0.0",
+  "httpx>=0.27.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+mcp-fiori-workflow = "mcp_fiori_workflow.server:run"
+
+[project.urls]
+Homepage = "https://github.com/ilanmateomoralesleyton/mcp-fiori-workflow"
+Repository = "https://github.com/ilanmateomoralesleyton/mcp-fiori-workflow"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_fiori_workflow"]
