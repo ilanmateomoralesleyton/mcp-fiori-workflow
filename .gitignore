@@ -8,3 +8,4 @@ build/
 venv/
 *.egg
 .DS_Store
+.gitignore.txt
