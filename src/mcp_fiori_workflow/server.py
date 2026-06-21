@@ -78,6 +78,71 @@ KNOWN_SCENARIOS = {
     "WS02000438": "Workflow adicional 2",
 }
 
+# ── Textos de ayuda para elicitación ─────────────────────────────────────────
+# Estos textos se usan en las descripciones de las herramientas para que
+# Claude Desktop SIEMPRE pregunte los valores antes de ejecutar.
+
+_SCENARIOS_HELP = (
+    "ESCENARIOS DISPONIBLES EN REUTTER:\n"
+    "- WS02000458: Liberación global de solicitud de pedido\n"
+    "- WS02000471: Liberación de posición de solicitud de pedido\n"
+    "SIEMPRE preguntar al usuario cuál escenario aplica antes de continuar."
+)
+
+_AGENT_RULES_HELP = (
+    "REGLAS DE AGENTE DISPONIBLES (WS02000471):\n"
+    "- '$0008$/RULE/MMPUR_MGR_RQSTR': Gestor del solicitante\n"
+    "- '$0008$/RULE/MMPUR_MGR_L_APPR': Gestor del último aprobador\n"
+    "- '$0008$/RULE/MMPUR_MGR_OF_MGR': Gestor del gestor\n"
+    "- '$0008$/RULE/MMPUR_ACC_RESP': Responsable de imputación\n"
+    "- '$0008$/RULE/MMPUR_PR_BD_AGNT': Determinación por BAdI\n"
+    "O bien un usuario SAP específico (ej: 'VPARDO')."
+)
+
+_STEP_CONDITIONS_HELP = (
+    "CONDICIONES DE PASO DISPONIBLES (imagen Fiori):\n"
+    "- Ninguna (sin condición de monto)\n"
+    "- Importe neto es igual o mayor que (amount_min)\n"
+    "- El importe neto total es inferior a (amount_max)\n"
+    "- Categoría de imputación de posición de solicitud de pedido\n"
+    "- ID de catálogo de posición de solicitud de pedido\n"
+    "- Indicador de creación (CreationIndicator)\n"
+    "- Estado de autorización externa\n"
+    "- Grupo de artículos\n"
+    "- Centro (Plant)\n"
+    "- Grupo de compras de la posición\n"
+    "- Organización de compras\n"
+    "SIEMPRE preguntar al usuario qué condición quiere aplicar."
+)
+
+_START_CONDITIONS_HELP = (
+    "CONDICIONES DE INICIO DISPONIBLES:\n"
+    "- '$0008$PurchasingGroup': Grupo de compras (ej: '109', '118')\n"
+    "- '$0008$PurchasingOrganization': Organización de compras\n"
+    "- '$0008$CreationIndicator': Indicador de creación (ej: 'V' = solicitud manual)\n"
+    "SIEMPRE preguntar al usuario qué condición de inicio aplicará."
+)
+
+_CREATE_WORKFLOW_QUESTIONS = (
+    "ANTES DE CREAR UN WORKFLOW, SIEMPRE PREGUNTAR AL USUARIO:\n"
+    "1. ¿Es 'Liberación global de solicitud de pedido' (WS02000458) "
+    "o 'Liberación de posición de solicitud de pedido' (WS02000471)?\n"
+    "2. ¿Cuál será el nombre (subject) del workflow?\n"
+    "3. ¿Cuál será la descripción?\n"
+    "4. ¿Válido desde qué fecha? (formato YYYY-MM-DD)\n"
+    "5. ¿Válido hasta qué fecha? (o sin límite)\n"
+    "6. ¿Cuál es la condición de inicio? (grupo de compras, org de compras, etc.)\n"
+    "7. ¿Cuántos pasos tendrá el workflow?\n"
+    "Para cada paso, preguntar:\n"
+    "  - Nombre del paso\n"
+    "  - ¿Es opcional (sí/no)?\n"
+    "  - ¿Excluir solicitantes como agentes (sí/no)?\n"
+    "  - ¿Quién es el liberador? (usuario SAP o regla estándar)\n"
+    "  - ¿Condición de monto? (desde/hasta en CLP u otra moneda)\n"
+    "  - ¿Tiene plazo (deadline)? Si sí: referencia de tiempo y acción\n"
+    "  - ¿Gestión de excepciones? (qué pasa si se rechaza)"
+)
+
 # ── Server ────────────────────────────────────────────────────────────────────
 app = Server("sap-fiori-workflow")
 
@@ -177,17 +242,20 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="create_workflow",
             description=(
-                "Crea un workflow nuevo desde cero para un escenario. "
-                "SIEMPRE preguntar al usuario: nombre del workflow, descripción, "
-                "fecha de inicio (validFrom) y condición de inicio (ej. grupo de compras)."
+                "Crea un workflow nuevo desde cero. "
+                + _CREATE_WORKFLOW_QUESTIONS
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "scenario_id": {"type": "string", "description": "Ej: 'WS02000471'"},
+                    "scenario_id": {
+                        "type": "string",
+                        "description": _SCENARIOS_HELP,
+                    },
                     "subject": {"type": "string", "description": "Nombre del workflow"},
-                    "description": {"type": "string", "description": "Descripción opcional"},
+                    "description": {"type": "string", "description": "Descripción del workflow"},
                     "valid_from": {"type": "string", "description": "Fecha inicio ISO 8601, ej: '2026-01-01T00:00:00.000Z'"},
+                    "valid_to": {"type": "string", "description": "Fecha fin ISO 8601. Omitir si es sin límite."},
                     "purchasing_group": {"type": "string", "description": "Grupo de compras SAP (condición de inicio), ej: '109'"},
                 },
                 "required": ["scenario_id", "subject"],
@@ -247,8 +315,13 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="update_workflow_header",
             description=(
-                "Actualiza campos de cabecera de un workflow DRAFT: nombre, descripción, fechas. "
-                "SIEMPRE preguntar los nuevos valores antes de ejecutar."
+                "Actualiza campos de cabecera de un workflow DRAFT. "
+                "ANTES DE EJECUTAR, SIEMPRE PREGUNTAR AL USUARIO los campos a modificar:\n"
+                "1. ¿Nuevo nombre (subject)?\n"
+                "2. ¿Nueva descripción?\n"
+                "3. ¿Nueva fecha de inicio (validFrom)? formato YYYY-MM-DD\n"
+                "4. ¿Nueva fecha de fin (validTo)? o sin límite\n"
+                "Solo preguntar los campos que el usuario quiere cambiar."
             ),
             inputSchema={
                 "type": "object",
@@ -265,8 +338,11 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="update_start_condition",
             description=(
-                "Modifica la condición de inicio de un workflow DRAFT (ej. grupo de compras, tipo de documento). "
-                "SIEMPRE preguntar: condition_id y los parámetros (nombre y valor) antes de ejecutar."
+                "Modifica la condición de inicio de un workflow DRAFT. "
+                "ANTES DE EJECUTAR, SIEMPRE PREGUNTAR AL USUARIO:\n"
+                "1. ¿Qué condición de inicio quiere modificar?\n"
+                + _START_CONDITIONS_HELP + "\n"
+                "2. ¿Cuál es el nuevo valor de la condición?"
             ),
             inputSchema={
                 "type": "object",
@@ -274,7 +350,7 @@ async def list_tools() -> list[Tool]:
                     "workflow_id": {"type": "string"},
                     "condition_id": {
                         "type": "string",
-                        "description": "ID de la condición SAP, ej: '$0008$PurchasingGroup'",
+                        "description": _START_CONDITIONS_HELP,
                     },
                     "parameters": {
                         "type": "object",
@@ -290,21 +366,32 @@ async def list_tools() -> list[Tool]:
             name="add_workflow_step",
             description=(
                 "Agrega un nuevo paso a un workflow DRAFT. "
-                "SIEMPRE preguntar antes de ejecutar: nombre del paso, usuario o regla asignada, "
-                "monto mínimo, monto máximo y moneda."
+                "ANTES DE EJECUTAR, SIEMPRE PREGUNTAR AL USUARIO:\n"
+                "1. ¿Cuál es el nombre del paso?\n"
+                "2. ¿El paso es opcional o obligatorio?\n"
+                "3. ¿Se deben excluir los solicitantes como agentes? (sí/no)\n"
+                "4. ¿Quién es el liberador? " + _AGENT_RULES_HELP + "\n"
+                "5. ¿Tiene condición de monto? " + _STEP_CONDITIONS_HELP + "\n"
+                "6. ¿En qué posición del workflow va? (al final, o antes de qué paso)\n"
+                "7. ¿Tiene plazo (deadline)? Si sí: referencia de tiempo (ej: 3 días) y acción (enviar mail / marcar como vencido)\n"
+                "8. ¿Gestión de excepciones al rechazar? (ej: cancelar workflow)"
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "workflow_id": {"type": "string"},
-                    "name": {"type": "string", "description": "Nombre del paso, ej: 'Liberación ≥ 2.000.001 CLP'"},
-                    "user_id": {"type": "string", "description": "Usuario SAP liberador. Mutuamente exclusivo con agent_rule_id."},
-                    "agent_rule_id": {"type": "string", "description": "Regla estándar SAP. Mutuamente exclusivo con user_id."},
-                    "amount_min": {"type": "integer", "description": "Monto mínimo exclusivo, ej: 2000001"},
-                    "amount_max": {"type": "integer", "description": "Monto máximo inclusivo. Omitir si es abierto."},
-                    "currency": {"type": "string", "default": "CLP"},
-                    "insert_at_index": {"type": "integer", "description": "Posición donde insertar (0 = primero). Omitir para agregar al final."},
-                    "is_optional": {"type": "string", "default": "1", "description": "'1' = opcional, '0' = obligatorio"},
+                    "name": {"type": "string", "description": "Nombre descriptivo del paso"},
+                    "user_id": {"type": "string", "description": "Usuario SAP liberador (ej: 'VPARDO'). Mutuamente exclusivo con agent_rule_id."},
+                    "agent_rule_id": {
+                        "type": "string",
+                        "description": _AGENT_RULES_HELP,
+                    },
+                    "amount_min": {"type": "integer", "description": "Monto mínimo exclusivo, ej: 1000001 = mayor a 1.000.000"},
+                    "amount_max": {"type": "integer", "description": "Monto máximo inclusivo. Omitir si es abierto hacia arriba."},
+                    "currency": {"type": "string", "default": "CLP", "description": "Moneda SAP, ej: 'CLP', 'USD'"},
+                    "insert_at_index": {"type": "integer", "description": "Posición donde insertar (0 = antes del primer paso). Omitir para agregar al final."},
+                    "is_optional": {"type": "string", "default": "1", "description": "'1' = paso opcional (se puede saltar), '0' = obligatorio"},
+                    "exclude_requestors": {"type": "string", "default": "2", "description": "'2' = excluir solicitantes como agentes, '1' = no excluir"},
                 },
                 "required": ["workflow_id", "name"],
             },
@@ -351,7 +438,10 @@ async def list_tools() -> list[Tool]:
             name="replace_step_agent",
             description=(
                 "Reemplaza el agente/liberador de un paso en un workflow DRAFT. "
-                "Acepta usuario específico (user_id) o regla estándar (agent_rule_id)."
+                "ANTES DE EJECUTAR, SIEMPRE PREGUNTAR AL USUARIO:\n"
+                "1. ¿Qué paso quiere modificar? (obtener con get_workflow_steps primero)\n"
+                "2. ¿Quién será el nuevo liberador?\n"
+                + _AGENT_RULES_HELP
             ),
             inputSchema={
                 "type": "object",
@@ -378,7 +468,12 @@ async def list_tools() -> list[Tool]:
             name="update_step_conditions",
             description=(
                 "Actualiza las condiciones de monto de un paso en un workflow DRAFT. "
-                "SIEMPRE preguntar: amount_min, amount_max y currency antes de ejecutar."
+                "ANTES DE EJECUTAR, SIEMPRE PREGUNTAR AL USUARIO:\n"
+                "1. ¿Qué paso quiere modificar? (obtener con get_workflow_steps primero)\n"
+                "2. ¿Tiene monto mínimo? (ej: 1.000.001 CLP = 'mayor a 1.000.000')\n"
+                "3. ¿Tiene monto máximo? (ej: 2.000.000 CLP = 'hasta 2.000.000', o abierto hacia arriba)\n"
+                "4. ¿En qué moneda? (CLP por defecto)\n"
+                + _STEP_CONDITIONS_HELP
             ),
             inputSchema={
                 "type": "object",
@@ -409,7 +504,10 @@ async def list_tools() -> list[Tool]:
             name="save_workflow_order",
             description=(
                 "Modifica el orden de prioridad de los workflows de un escenario. "
-                "SIEMPRE preguntar el nuevo orden (lista de WorkflowIds) antes de ejecutar."
+                "ANTES DE EJECUTAR, SIEMPRE:\n"
+                "1. Llamar get_workflow_order para mostrar el orden actual al usuario\n"
+                "2. Preguntar al usuario qué nuevo orden desea\n"
+                "3. Confirmar el nuevo orden antes de guardar"
             ),
             inputSchema={
                 "type": "object",
@@ -646,18 +744,22 @@ async def _dispatch(name: str, args: dict, client: SAPClient) -> list[TextConten
 
     # ── add_workflow_step ─────────────────────────────────────────────────────
     elif name == "add_workflow_step":
-        workflow_id   = args["workflow_id"]
-        name_step     = args["name"]
-        user_id       = args.get("user_id")
-        agent_rule_id = args.get("agent_rule_id")
-        amount_min    = args.get("amount_min")
-        amount_max    = args.get("amount_max")
-        currency      = args.get("currency", "CLP")
-        insert_at     = args.get("insert_at_index")
-        is_optional   = args.get("is_optional", "1")
+        workflow_id         = args["workflow_id"]
+        name_step           = args["name"]
+        user_id             = args.get("user_id")
+        agent_rule_id       = args.get("agent_rule_id")
+        amount_min          = args.get("amount_min")
+        amount_max          = args.get("amount_max")
+        currency            = args.get("currency", "CLP")
+        insert_at           = args.get("insert_at_index")
+        is_optional         = args.get("is_optional", "1")
+        exclude_requestors  = args.get("exclude_requestors", "2")
 
         if not user_id and not agent_rule_id:
-            return err("Debes proporcionar user_id o agent_rule_id. ¿Quién será el liberador?")
+            return err(
+                "Falta el liberador del paso. ¿Quién aprobará este paso?\n"
+                + _AGENT_RULES_HELP
+            )
         if user_id and agent_rule_id:
             return err("Solo puedes proporcionar user_id O agent_rule_id, no ambos.")
 
@@ -668,7 +770,8 @@ async def _dispatch(name: str, args: dict, client: SAPClient) -> list[TextConten
         xml_modified = add_activity(
             xml_original, name=name_step, principals=principals,
             amount_min=amount_min, amount_max=amount_max, currency=currency,
-            is_optional=is_optional, insert_at_index=insert_at,
+            is_optional=is_optional, exclude_requestors=exclude_requestors,
+            insert_at_index=insert_at,
         )
         client.update_workflow(workflow_id, xml_modified)
 
