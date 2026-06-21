@@ -38,9 +38,14 @@ class SAPClient:
         )
 
     def _get_csrf_token(self) -> str:
+        # SAP OData v2 responde $metadata solo en application/xml — no en JSON.
+        # Forzamos Accept: application/xml aquí para evitar el 406 Not Acceptable.
         resp = self._http.get(
             f"{self.base_url}/$metadata",
-            headers={"x-csrf-token": "Fetch"},
+            headers={
+                "x-csrf-token": "Fetch",
+                "Accept":       "application/xml, text/xml, */*",
+            },
             params={"sap-client": self.sap_client},
         )
         resp.raise_for_status()
