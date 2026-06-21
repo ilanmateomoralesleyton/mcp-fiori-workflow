@@ -611,44 +611,76 @@ async def _dispatch(name: str, args: dict, client: SAPClient) -> list[TextConten
 
     # ── create_workflow ───────────────────────────────────────────────────────
     elif name == "create_workflow":
-        scenario_id     = args["scenario_id"]
-        subject         = args["subject"]
-        description     = args.get("description", "")
-        valid_from      = args.get("valid_from", "")
+        scenario_id      = args["scenario_id"]
+        subject          = args["subject"]
+        description      = args.get("description", "")
+        valid_from       = args.get("valid_from", "")
+        valid_to         = args.get("valid_to", "")
         purchasing_group = args.get("purchasing_group", "")
 
-        # Obtener template XML del escenario
-        xml_template = client.get_function_xml_resource(
+        # NOTA: CreateWorkflow devuelve metadatos del escenario (scenarioDefinition),
+        # NO un XML de workflow. Hay que construir el XML desde cero con la
+        # estructura correcta que SAP espera (igual a los workflows existentes).
+
+        # Usamos CreateWorkflow solo para obtener la scenarioVersion
+        template_xml = client.get_function_xml_resource(
             "CreateWorkflow", {"ScenarioId": f"'{scenario_id}'"}
         )
-        xml_clean = clear_workflow_id(xml_template)
+        try:
+            troot = ET.fromstring(template_xml)
+            sv_el = troot.find("scenarioVersion")
+            scenario_version = sv_el.text if sv_el is not None and sv_el.text else "0008"
+        except Exception:
+            scenario_version = "0008"
 
-        # Aplicar cabecera
-        xml_clean = update_workflow_header(
-            xml_clean,
-            subject=subject,
-            description=description if description else None,
-            valid_from=valid_from if valid_from else None,
-        )
+        prefix = f"${scenario_version}$"
+        valid_from_str = valid_from if valid_from else "2026-01-01T00:00:00.000Z"
 
-        # Condición de inicio si se especificó grupo de compras
+        # Construir bloques opcionales
+        desc_xml     = f"  <description>{description}</description>\n" if description else ""
+        valid_to_xml = f"  <validTo>{valid_to}</validTo>\n"            if valid_to    else ""
+
+        start_cond_xml = ""
         if purchasing_group:
-            root = ET.fromstring(xml_clean)
-            sv = root.find("scenarioVersion")
-            prefix = f"${sv.text}$" if sv is not None and sv.text else "$0008$"
-            xml_clean = update_start_condition(
-                xml_clean,
-                condition_id=f"{prefix}PurchasingGroup",
-                parameters={"PurchasingGroup": purchasing_group},
+            start_cond_xml = (
+                f"  <startConditions>\n"
+                f"    <condition id=\"{prefix}PurchasingGroup\">\n"
+                f"      <parameterValues>\n"
+                f"        <parameterValue name=\"PurchasingGroup\">{purchasing_group}</parameterValue>\n"
+                f"      </parameterValues>\n"
+                f"    </condition>\n"
+                f"  </startConditions>\n"
             )
 
-        new_id = client.create_workflow(xml_clean)
+        xml_new = (
+            "<?xml version='1.0' encoding='utf-8'?>\n"
+            f"<workflow id=\"\" formatVersion=\"3.0\" originalLanguage=\"ES\" "
+            f"targetLanguage=\"ES\" originalLanguageText=\"Español\">\n"
+            f"  <scenario>{scenario_id}</scenario>\n"
+            f"  <scenarioVersion>{scenario_version}</scenarioVersion>\n"
+            f"  <subject>{subject}</subject>\n"
+            f"{desc_xml}"
+            f"  <validFrom>{valid_from_str}</validFrom>\n"
+            f"{valid_to_xml}"
+            f"{start_cond_xml}"
+            f"  <processFlow artifactId=\"80000000\">\n"
+            f"  </processFlow>\n"
+            f"</workflow>"
+        )
+
+        new_id = client.create_workflow(xml_new)
         return ok({
-            "success":      True,
-            "new_draft_id": new_id,
-            "scenario_id":  scenario_id,
-            "subject":      subject,
-            "message":      f"Workflow '{new_id}' creado como borrador. Agrega pasos con add_workflow_step y actívalo con activate_workflow.",
+            "success":           True,
+            "new_draft_id":      new_id,
+            "scenario_id":       scenario_id,
+            "scenario_version":  scenario_version,
+            "subject":           subject,
+            "purchasing_group":  purchasing_group,
+            "message": (
+                f"Workflow \'{new_id}\' creado como borrador vacío. "
+                "Usa add_workflow_step para agregar los pasos y "
+                "activate_workflow para activarlo cuando esté listo."
+            ),
         })
 
     # ── delete_workflow ───────────────────────────────────────────────────────
