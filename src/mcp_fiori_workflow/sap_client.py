@@ -156,6 +156,10 @@ class SAPClient:
         SAP devuelve XML con el WorkflowId asignado en <d:WorkflowId>.
         Devuelve el nuevo WorkflowId como string.
         """
+        import logging
+        _log = logging.getLogger(__name__)
+        _log.info(f"POST /Workflows - XML enviado (primeros 2000 chars):\n{xml_content[:2000]}")
+
         resp = self._http.post(
             f"{self.base_url}/Workflows",
             params={"sap-client": self.sap_client},
@@ -166,6 +170,14 @@ class SAPClient:
                 "Accept":       "application/xml",
             },
         )
+
+        _log.info(f"POST /Workflows - Status: {resp.status_code}")
+        if resp.status_code >= 400:
+            _log.error(f"POST /Workflows - Error response: {resp.text[:2000]}")
+            raise Exception(
+                f"SAP devolvió {resp.status_code}. "
+                f"Detalle del error: {resp.text[:1000]}"
+            )
         resp.raise_for_status()
 
         # Extraer WorkflowId del response XML
