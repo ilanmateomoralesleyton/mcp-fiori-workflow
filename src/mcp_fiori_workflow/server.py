@@ -26,6 +26,8 @@ from mcp_fiori_workflow.sap_client import SAPClient
 from mcp_fiori_workflow.workflow_xml import (
     parse_activities,
     replace_principals_in_activity,
+    update_activity_conditions,
+    add_activity,
     summarize_xml,
     clear_workflow_id,
 )
@@ -207,6 +209,95 @@ async def list_tools() -> list[Tool]:
                     "workflow_id": {"type": "string"},
                 },
                 "required": ["workflow_id"],
+            },
+        ),
+        Tool(
+            name="update_step_conditions",
+            description=(
+                "Actualiza las condiciones de monto de un paso existente en un workflow DRAFT. "
+                "Permite definir rango mínimo y/o máximo de monto para que el paso se active. "
+                "SIEMPRE preguntar al usuario: amount_min, amount_max y currency antes de ejecutar. "
+                "El workflow debe estar en estado DRAFT."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workflow_id": {
+                        "type": "string",
+                        "description": "WorkflowId del borrador DRAFT",
+                    },
+                    "step_index": {
+                        "type": "integer",
+                        "description": "Índice del paso a modificar (0 = primer paso)",
+                    },
+                    "amount_min": {
+                        "type": "integer",
+                        "description": "Monto mínimo exclusivo en centavos/unidad entera. Ej: 1000001 = mayor a 1.000.000",
+                    },
+                    "amount_max": {
+                        "type": "integer",
+                        "description": "Monto máximo inclusivo. Ej: 2000000 = hasta 2.000.000. Omitir si es abierto hacia arriba.",
+                    },
+                    "currency": {
+                        "type": "string",
+                        "description": "Moneda SAP. Default: CLP",
+                        "default": "CLP",
+                    },
+                },
+                "required": ["workflow_id", "step_index"],
+            },
+        ),
+        Tool(
+            name="add_workflow_step",
+            description=(
+                "Agrega un nuevo paso (activity) a un workflow DRAFT. "
+                "SIEMPRE preguntar al usuario antes de ejecutar: "
+                "nombre del paso, usuario o regla asignada, monto mínimo, monto máximo y moneda. "
+                "El workflow debe estar en estado DRAFT."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workflow_id": {
+                        "type": "string",
+                        "description": "WorkflowId del borrador DRAFT",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Nombre descriptivo del paso. Ej: 'Liberación de 2.000.001 en adelante'",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Usuario SAP asignado como liberador. Mutuamente exclusivo con agent_rule_id.",
+                    },
+                    "agent_rule_id": {
+                        "type": "string",
+                        "description": "Regla estándar SAP. Mutuamente exclusivo con user_id.",
+                    },
+                    "amount_min": {
+                        "type": "integer",
+                        "description": "Monto mínimo exclusivo. Ej: 2000001 = mayor a 2.000.000",
+                    },
+                    "amount_max": {
+                        "type": "integer",
+                        "description": "Monto máximo inclusivo. Omitir si es abierto hacia arriba.",
+                    },
+                    "currency": {
+                        "type": "string",
+                        "description": "Moneda SAP. Default: CLP",
+                        "default": "CLP",
+                    },
+                    "insert_at_index": {
+                        "type": "integer",
+                        "description": "Posición donde insertar el paso (0 = antes del primero). Omitir para agregar al final.",
+                    },
+                    "is_optional": {
+                        "type": "string",
+                        "description": "'1' = paso opcional, '0' = paso obligatorio. Default: '1'",
+                        "default": "1",
+                    },
+                },
+                "required": ["workflow_id", "name"],
             },
         ),
     ]
@@ -412,6 +503,123 @@ async def _dispatch(name: str, args: dict, client: SAPClient) -> list[TextConten
         workflow_id = args["workflow_id"]
         xml_text    = client.get_text(f"Workflows('{workflow_id}')/$value")
         return ok({"workflow_id": workflow_id, "xml": xml_text})
+
+    # ── update_step_conditions ────────────────────────────────────────────────
+    elif name == "update_step_conditions":
+        workflow_id = args["workflow_id"]
+        step_index  = args["step_index"]
+        amount_min  = args.get("amount_min")
+        amount_max  = args.get("amount_max")
+        currency    = args.get("currency", "CLP")
+
+        if amount_min is None and amount_max is None:
+            return err(
+                "Debes proporcionar al menos amount_min o amount_max. "
+                "¿Cuál es el rango de monto para este paso?"
+            )
+
+        # Verificar DRAFT
+        wf_data = client.get(f"Workflows('{workflow_id}')")
+        status  = wf_data.get("d", {}).get("Status", "")
+        if status != "DRAFT":
+            return err(f"El workflow '{workflow_id}' está en estado '{status}'. Debe ser DRAFT.")
+
+        xml_original = client.get_text(f"Workflows('{workflow_id}')/$value")
+        activities   = parse_activities(xml_original)
+
+        if step_index >= len(activities):
+            return err(
+                f"step_index {step_index} inválido. "
+                f"El workflow tiene {len(activities)} pasos (0-{len(activities)-1})."
+            )
+
+        before = activities[step_index]
+
+        xml_modified = update_activity_conditions(
+            xml_original, step_index, amount_min, amount_max, currency
+        )
+        client.update_workflow(workflow_id, xml_modified)
+
+        return ok({
+            "success":     True,
+            "workflow_id": workflow_id,
+            "step_index":  step_index,
+            "step_name":   before.name,
+            "conditions_updated": {
+                "amount_min": amount_min,
+                "amount_max": amount_max,
+                "currency":   currency,
+            },
+            "next_step": "Usa activate_workflow para activar cuando estés conforme.",
+        })
+
+    # ── add_workflow_step ─────────────────────────────────────────────────────
+    elif name == "add_workflow_step":
+        workflow_id    = args["workflow_id"]
+        name_step      = args["name"]
+        user_id        = args.get("user_id")
+        agent_rule_id  = args.get("agent_rule_id")
+        amount_min     = args.get("amount_min")
+        amount_max     = args.get("amount_max")
+        currency       = args.get("currency", "CLP")
+        insert_at      = args.get("insert_at_index")
+        is_optional    = args.get("is_optional", "1")
+
+        if not name_step:
+            return err("Debes proporcionar el nombre del paso (name).")
+        if not user_id and not agent_rule_id:
+            return err(
+                "Debes proporcionar user_id o agent_rule_id para el nuevo paso. "
+                "¿Quién será el liberador?"
+            )
+        if user_id and agent_rule_id:
+            return err("Solo puedes proporcionar user_id O agent_rule_id, no ambos.")
+
+        # Verificar DRAFT
+        wf_data = client.get(f"Workflows('{workflow_id}')")
+        status  = wf_data.get("d", {}).get("Status", "")
+        if status != "DRAFT":
+            return err(f"El workflow '{workflow_id}' está en estado '{status}'. Debe ser DRAFT.")
+
+        xml_original = client.get_text(f"Workflows('{workflow_id}')/$value")
+
+        if user_id:
+            principals = [{"id": user_id, "type": "USER"}]
+        else:
+            principals = [{"id": agent_rule_id, "type": "RULE"}]
+
+        xml_modified = add_activity(
+            xml_original,
+            name=name_step,
+            principals=principals,
+            amount_min=amount_min,
+            amount_max=amount_max,
+            currency=currency,
+            is_optional=is_optional,
+            insert_at_index=insert_at,
+        )
+
+        client.update_workflow(workflow_id, xml_modified)
+
+        # Verificar resultado
+        xml_after      = client.get_text(f"Workflows('{workflow_id}')/$value")
+        activities_after = parse_activities(xml_after)
+
+        return ok({
+            "success":        True,
+            "workflow_id":    workflow_id,
+            "new_step_name":  name_step,
+            "total_steps":    len(activities_after),
+            "steps_after":    [
+                {
+                    "index":      a.index,
+                    "name":       a.name,
+                    "principals": a.principals,
+                }
+                for a in activities_after
+            ],
+            "next_step": "Usa activate_workflow para activar cuando estés conforme.",
+        })
 
     else:
         return err(f"Herramienta desconocida: {name}")

@@ -203,6 +203,170 @@ def summarize_xml(xml_text: str) -> dict:
     }
 
 
+def _build_conditions(
+    amount_min: Optional[int] = None,
+    amount_max: Optional[int] = None,
+    currency: str = "CLP",
+    step_prefix: str = "$0008$",
+) -> ET.Element:
+    """
+    Construye el bloque <conditions> para un paso.
+
+    Lógica:
+    - Solo amount_min              → condición "mayor que amount_min"
+    - amount_min + amount_max      → condición "mayor que amount_min" Y "menor o igual a amount_max"
+    - Sin parámetros               → sin condiciones (paso sin restricción de monto)
+
+    Condición SAP disponible: TotalNetAmountGreater (NetAmount, Currency)
+    Para rango usamos dos condiciones: Greater(min) + LessOrEqual(max).
+    """
+    conds_el = ET.Element("conditions")
+
+    if amount_min is not None:
+        cond = ET.SubElement(conds_el, "condition")
+        cond.set("id", f"{step_prefix}TotalNetAmountGreater")
+        pvals = ET.SubElement(cond, "parameterValues")
+        pv1 = ET.SubElement(pvals, "parameterValue")
+        pv1.set("name", "NetAmount")
+        pv1.text = str(amount_min)
+        pv2 = ET.SubElement(pvals, "parameterValue")
+        pv2.set("name", "Currency")
+        pv2.text = currency
+
+    if amount_max is not None:
+        cond2 = ET.SubElement(conds_el, "condition")
+        cond2.set("id", f"{step_prefix}TotalNetAmountLessOrEqual")
+        pvals2 = ET.SubElement(cond2, "parameterValues")
+        pv3 = ET.SubElement(pvals2, "parameterValue")
+        pv3.set("name", "NetAmount")
+        pv3.text = str(amount_max)
+        pv4 = ET.SubElement(pvals2, "parameterValue")
+        pv4.set("name", "Currency")
+        pv4.text = currency
+
+    return conds_el
+
+
+def update_activity_conditions(
+    xml_text: str,
+    activity_index: int,
+    amount_min: Optional[int] = None,
+    amount_max: Optional[int] = None,
+    currency: str = "CLP",
+) -> str:
+    """
+    Actualiza las condiciones de monto de un paso existente.
+
+    - amount_min: monto mínimo exclusivo (ej: 1000001 → mayor a 1.000.000)
+    - amount_max: monto máximo inclusivo (ej: 2000000 → hasta 2.000.000)
+    - currency:   moneda (default CLP)
+    """
+    root = ET.fromstring(xml_text)
+    process_flow = root.find("processFlow")
+    if process_flow is None:
+        raise ValueError("El XML no tiene <processFlow>")
+
+    activities = process_flow.findall("activity")
+    if activity_index >= len(activities):
+        raise IndexError(
+            f"step_index {activity_index} inválido. "
+            f"El workflow tiene {len(activities)} pasos (0-{len(activities)-1})."
+        )
+
+    act = activities[activity_index]
+
+    # Eliminar condiciones existentes
+    old_conds = act.find("conditions")
+    if old_conds is not None:
+        act.remove(old_conds)
+
+    # Insertar nuevas condiciones después de <step>
+    new_conds = _build_conditions(amount_min, amount_max, currency)
+    _insert_after_first(act, ["step"], new_conds)
+
+    return ET.tostring(root, encoding="unicode", xml_declaration=True)
+
+
+def add_activity(
+    xml_text: str,
+    name: str,
+    principals: list[dict],
+    amount_min: Optional[int] = None,
+    amount_max: Optional[int] = None,
+    currency: str = "CLP",
+    step_id: str = "$0008$ReleasePurchaseRequisitionItem",
+    is_optional: str = "1",
+    insert_at_index: Optional[int] = None,
+) -> str:
+    """
+    Agrega un nuevo paso (activity) al processFlow.
+
+    - name:             nombre del paso, ej: "Liberación de 2.000.001 en adelante"
+    - principals:       lista de {id, type} — igual que replace_principals_in_activity
+    - amount_min:       monto mínimo (opcional)
+    - amount_max:       monto máximo (opcional)
+    - currency:         moneda (default CLP)
+    - step_id:          tipo de paso SAP (default: liberar posición SolPed)
+    - is_optional:      "1" opcional, "0" obligatorio
+    - insert_at_index:  posición donde insertar (None = al final)
+    """
+    root = ET.fromstring(xml_text)
+    process_flow = root.find("processFlow")
+    if process_flow is None:
+        raise ValueError("El XML no tiene <processFlow>")
+
+    # Calcular nuevo artifactId (max existente + 1)
+    existing = process_flow.findall("activity")
+    max_artifact = 80000000
+    for act in existing:
+        try:
+            aid = int(act.get("artifactId", "0"))
+            if aid > max_artifact:
+                max_artifact = aid
+        except ValueError:
+            pass
+    new_artifact_id = str(max_artifact + 1)
+
+    # Construir nueva activity
+    new_act = ET.Element("activity")
+    new_act.set("multiInstance", "0")
+    new_act.set("artifactId", new_artifact_id)
+
+    # <name>
+    name_el = ET.SubElement(new_act, "name")
+    name_el.text = name
+
+    # <step>
+    step_el = ET.SubElement(new_act, "step")
+    step_el.set("id", step_id)
+
+    # <conditions>
+    if amount_min is not None or amount_max is not None:
+        conds = _build_conditions(amount_min, amount_max, currency)
+        new_act.append(conds)
+
+    # <assignedPrincipals>
+    ap_el = ET.SubElement(new_act, "assignedPrincipals")
+    for p in principals:
+        p_el = ET.SubElement(ap_el, "assignedPrincipal")
+        p_el.set("id",   p["id"])
+        p_el.set("type", p.get("type", "USER"))
+
+    # <properties>
+    props_el = ET.SubElement(new_act, "properties")
+    prop_el = ET.SubElement(props_el, "property")
+    prop_el.set("id", "$0008$IsOptional")
+    prop_el.text = is_optional
+
+    # Insertar en la posición correcta
+    if insert_at_index is not None and insert_at_index <= len(existing):
+        process_flow.insert(list(process_flow).index(existing[0]) + insert_at_index, new_act)
+    else:
+        process_flow.append(new_act)
+
+    return ET.tostring(root, encoding="unicode", xml_declaration=True)
+
+
 def clear_workflow_id(xml_text: str) -> str:
     """Limpia el id del workflow para usarlo como nuevo borrador (id='')."""
     root = ET.fromstring(xml_text)
