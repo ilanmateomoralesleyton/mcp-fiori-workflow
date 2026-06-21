@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-fiori-workflow"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server para gestionar Flexible Workflows de SAP S/4HANA vía OData (app F2190)"
 readme = "README.md"
 requires-python = ">=3.11"
