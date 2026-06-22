@@ -1,5 +1,6 @@
 """
-MCP Server: SAP Fiori Flexible Workflow Manager v0.4.0
+MCP Server: SAP Fiori Flexible Workflow Manager
+(versión definida en mcp_fiori_workflow.__version__)
 Opera la app F2190 (Gestionar Workflows) vía OData SWF_FLEX_DEF_SRV.
 
 Herramientas — paridad completa con la app Fiori:
@@ -32,6 +33,11 @@ Herramientas — paridad completa con la app Fiori:
   ORDEN:
     get_workflow_order      → ver prioridad de workflows en el escenario
     save_workflow_order     → modificar orden de prioridad
+
+  CATÁLOGO Y CARGA BATCH:
+    get_scenario_catalog      → catálogo (condiciones/reglas) del escenario desde SAP
+    create_workflows_batch    → crear N workflows DRAFT desde Excel (valida → confirma)
+    activate_workflows_batch  → activar en lote (todo / nada / parcial)
 """
 
 import os
@@ -44,6 +50,9 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+from mcp_fiori_workflow import __version__
+from mcp_fiori_workflow.batch import validate_batch
+from mcp_fiori_workflow.params import gate_params, KNOWN_SCENARIOS
 from mcp_fiori_workflow.sap_client import SAPClient
 from mcp_fiori_workflow.workflow_xml import (
     parse_activities,
@@ -58,25 +67,21 @@ from mcp_fiori_workflow.workflow_xml import (
     update_workflow_header,
     update_start_condition,
     clear_workflow_id,
+    build_workflow_xml,
+    parse_scenario_catalog,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Configuración ─────────────────────────────────────────────────────────────
-SAP_HOST     = os.environ.get("SAP_HOST",     "https://vhereqs4ci.sap.reutter.cl:44300")
-SAP_CLIENT   = os.environ.get("SAP_CLIENT",   "200")
+# Todos los datos de conexión provienen EXCLUSIVAMENTE de variables de entorno
+# definidas en la conexión MCP (claude_desktop_config.json). Nunca se hardcodea
+# un host: cada conexión configurada apunta a su propio servidor SAP.
+SAP_HOST     = os.environ.get("SAP_HOST",     "")
+SAP_CLIENT   = os.environ.get("SAP_CLIENT",   "")
 SAP_USER     = os.environ.get("SAP_USER",     "")
 SAP_PASSWORD = os.environ.get("SAP_PASSWORD", "")
-
-KNOWN_SCENARIOS = {
-    "WS02000458": "Liberación global de solicitud de pedido",
-    "WS02000471": "Liberación de posición solicitud pedido",
-    "WS00800157": "Workflow de pedido (genérico)",
-    "WS00800173": "Workflow de pedido (genérico 2)",
-    "WS02000434": "Workflow adicional",
-    "WS02000438": "Workflow adicional 2",
-}
 
 # ── Textos de ayuda para elicitación ─────────────────────────────────────────
 # Estos textos se usan en las descripciones de las herramientas para que
@@ -144,12 +149,25 @@ _CREATE_WORKFLOW_QUESTIONS = (
 )
 
 # ── Server ────────────────────────────────────────────────────────────────────
-app = Server("sap-fiori-workflow")
+app = Server("sap-fiori-workflow", version=__version__)
 
 
 def get_client() -> SAPClient:
-    if not SAP_USER or not SAP_PASSWORD:
-        raise RuntimeError("Faltan credenciales. Define SAP_USER y SAP_PASSWORD.")
+    faltantes = [
+        nombre for nombre, valor in (
+            ("SAP_HOST",     SAP_HOST),
+            ("SAP_CLIENT",   SAP_CLIENT),
+            ("SAP_USER",     SAP_USER),
+            ("SAP_PASSWORD", SAP_PASSWORD),
+        ) if not valor
+    ]
+    if faltantes:
+        raise RuntimeError(
+            "Faltan variables de entorno de conexión SAP: "
+            + ", ".join(faltantes)
+            + ". Configúralas en la conexión MCP (claude_desktop_config.json). "
+            "El host nunca está predefinido: depende de la conexión configurada."
+        )
     return SAPClient(SAP_HOST, SAP_CLIENT, SAP_USER, SAP_PASSWORD)
 
 
@@ -172,6 +190,50 @@ def _check_draft(client: SAPClient, workflow_id: str) -> str:
             "Usa copy_workflow primero."
         )
     return status
+
+
+def _scenario_version(client: SAPClient, scenario_id: str) -> str:
+    """Obtiene la scenarioVersion (ej '0008') desde la definición del escenario."""
+    try:
+        xml_def = client.get_function_xml_resource("CreateWorkflow", {"ScenarioId": f"'{scenario_id}'"})
+        root = ET.fromstring(xml_def)
+        for el in root.iter():
+            tag = el.tag.split("}", 1)[1] if "}" in el.tag else el.tag
+            if tag == "scenarioVersion" and el.text:
+                return el.text.strip()
+    except Exception:
+        logger.exception(f"No se pudo obtener scenarioVersion de '{scenario_id}'")
+    return "0008"
+
+
+def _detect_duplicates(client: SAPClient, workflows: list) -> list:
+    """
+    Detecta workflows del lote cuyo subject ya existe en su escenario (cualquier
+    status). Hace una sola lectura por escenario distinto. Devuelve una lista de
+    {workflow_key, subject, scenario_id, existentes: [{workflow_id, status}]}.
+    """
+    existentes_por_escenario: dict = {}
+    for sid in {wf.get("scenario_id") for wf in workflows if wf.get("scenario_id")}:
+        data = client.get("Workflows", {"$filter": f"ScenarioId eq '{sid}'", "$top": "500"})
+        mapa: dict = {}
+        for r in data.get("d", {}).get("results", []):
+            subj = (r.get("Subject") or "").strip().lower()
+            mapa.setdefault(subj, []).append({"workflow_id": r.get("WorkflowId"), "status": r.get("Status")})
+        existentes_por_escenario[sid] = mapa
+
+    duplicados = []
+    for wf in workflows:
+        sid = wf.get("scenario_id")
+        subj = (wf.get("subject") or "").strip().lower()
+        mapa = existentes_por_escenario.get(sid, {})
+        if subj and subj in mapa:
+            duplicados.append({
+                "workflow_key": wf.get("workflow_key"),
+                "subject": wf.get("subject"),
+                "scenario_id": sid,
+                "existentes": mapa[subj],
+            })
+    return duplicados
 
 
 # ── Definición de herramientas ────────────────────────────────────────────────
@@ -522,6 +584,88 @@ async def list_tools() -> list[Tool]:
                 "required": ["scenario_id", "workflow_ids_ordered"],
             },
         ),
+
+        # ── CATÁLOGO Y CARGA BATCH ────────────────────────────────────────────
+        Tool(
+            name="get_scenario_catalog",
+            description=(
+                "Lee desde SAP la definición de un escenario (condiciones de inicio/paso, "
+                "pasos y reglas de agente disponibles, con sus etiquetas). Sirve para "
+                "resolver términos de negocio a códigos técnicos al cargar en batch, sin "
+                "hardcodear nada. Úsalo antes de create_workflows_batch para mapear el Excel."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "scenario_id": {"type": "string", "description": "Ej: 'WS02000471'"},
+                },
+                "required": ["scenario_id"],
+            },
+        ),
+        Tool(
+            name="create_workflows_batch",
+            description=(
+                "Crea MÚLTIPLES workflows como borrador (DRAFT) en una sola pasada, a partir "
+                "de un Excel ya mapeado a JSON técnico. Flujo en 2 fases:\n"
+                "1. confirm=false (default): VALIDA estructura, resuelve duplicados leyendo SAP "
+                "y devuelve el plan, errores y duplicados detectados SIN escribir nada. Muestra "
+                "el plan al usuario para una sola confirmación.\n"
+                "2. confirm=true + duplicate_decisions: crea los borradores. Continúa ante "
+                "errores y entrega un reporte (creados / omitidos_por_duplicado / fallidos).\n"
+                "Si hay duplicados (mismo subject en el escenario) SIN decisión, NO ejecuta y "
+                "pide decidir duplicar u omitir caso a caso. Nunca duplica por su cuenta. "
+                "Los workflows quedan en DRAFT; actívalos después con activate_workflows_batch."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workflows": {
+                        "type": "array",
+                        "description": (
+                            "Lista de workflows. Cada uno: {workflow_key, scenario_id, subject, "
+                            "description?, valid_from, valid_to?, start_conditions?: "
+                            "[{condition_id, parameters}], steps: [{name, principal:{type:USER|RULE|"
+                            "ROLE, id}, amount_min?, amount_max?, currency?, is_optional?, "
+                            "exclude_requestors?, step_id?}]}."
+                        ),
+                        "items": {"type": "object"},
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "false = solo validar y mostrar plan. true = crear los borradores.",
+                    },
+                    "duplicate_decisions": {
+                        "type": "object",
+                        "description": (
+                            "Decisión por workflow_key duplicado: 'duplicar' u 'omitir'. "
+                            'Ej: {"WF-001": "duplicar", "WF-007": "omitir"}.'
+                        ),
+                    },
+                },
+                "required": ["workflows"],
+            },
+        ),
+        Tool(
+            name="activate_workflows_batch",
+            description=(
+                "Activa en lote los borradores indicados (DRAFT → ACTIVE). Úsalo tras "
+                "create_workflows_batch y DESPUÉS de consultar al usuario si activar TODO, "
+                "NADA o un subconjunto (PARCIAL). Para 'nada' simplemente no se llama. "
+                "Continúa ante errores y reporta activados y fallidos."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workflow_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "WorkflowIds de los borradores a activar (subconjunto elegido por el usuario).",
+                    },
+                },
+                "required": ["workflow_ids"],
+            },
+        ),
     ]
 
 
@@ -544,6 +688,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 async def _dispatch(name: str, args: dict, client: SAPClient) -> list[TextContent]:
+
+    # ── Compuerta de parámetros ────────────────────────────────────────────────
+    # Antes de ejecutar, exige que estén resueltos todos los parámetros faltantes
+    # (requeridos y opcionales). Si faltan, devuelve preguntas con opciones para
+    # que Claude consulte a la persona usuaria. Nunca se asumen valores.
+    faltan = gate_params(name, args)
+    if faltan is not None:
+        return ok(faltan)
+    args.pop("_confirmado", None)
 
     # ── list_scenarios ────────────────────────────────────────────────────────
     if name == "list_scenarios":
@@ -982,6 +1135,164 @@ async def _dispatch(name: str, args: dict, client: SAPClient) -> list[TextConten
             "success":    True,
             "scenario_id": scenario_id,
             "new_order":  workflow_ids_ordered,
+        })
+
+    # ── get_scenario_catalog ──────────────────────────────────────────────────
+    elif name == "get_scenario_catalog":
+        scenario_id = args["scenario_id"]
+        xml_def = client.get_function_xml_resource("CreateWorkflow", {"ScenarioId": f"'{scenario_id}'"})
+        return ok(parse_scenario_catalog(xml_def))
+
+    # ── create_workflows_batch ────────────────────────────────────────────────
+    elif name == "create_workflows_batch":
+        workflows = args.get("workflows") or []
+        confirm   = bool(args.get("confirm", False))
+        decisions = args.get("duplicate_decisions") or {}
+
+        if not workflows:
+            return err("No se recibieron workflows. Envía 'workflows': [...] con al menos un elemento.")
+
+        # 1. Validación estructural (sin tocar SAP)
+        plan, errores = validate_batch(workflows)
+
+        # 2. Detección de duplicados (lectura SAP)
+        duplicados = _detect_duplicates(client, workflows)
+
+        # ── Fase 1: validar y mostrar plan ──────────────────────────────────
+        if not confirm:
+            return ok({
+                "status": "plan_validado",
+                "resumen": {
+                    "workflows":       len(workflows),
+                    "pasos_totales":   sum(len(wf.get("steps") or []) for wf in workflows),
+                    "con_errores":     len(errores),
+                    "duplicados":      len(duplicados),
+                },
+                "plan":                  plan,
+                "errores":               errores,
+                "duplicados_detectados": duplicados,
+                "siguiente_paso": (
+                    "Revisa el plan con el usuario. Si hay errores, corrígelos en el origen. "
+                    "Por cada duplicado, pregunta al usuario si DUPLICAR u OMITIR (opciones, con "
+                    "atajos 'todas'). Luego vuelve a llamar con confirm=true y duplicate_decisions."
+                ),
+            })
+
+        # ── Fase 2: ejecutar ────────────────────────────────────────────────
+        if errores:
+            return ok({
+                "status":  "errores_de_validacion",
+                "mensaje": "No se creó nada: corrige estos errores antes de ejecutar.",
+                "errores": errores,
+            })
+
+        # Exigir decisión para cada duplicado detectado (no asumir)
+        sin_decision = [
+            d for d in duplicados
+            if decisions.get(d["workflow_key"]) not in ("duplicar", "omitir")
+        ]
+        if sin_decision:
+            return ok({
+                "status": "necesito_decision_duplicados",
+                "mensaje": "No se creó nada. Hay duplicados sin decisión.",
+                "duplicados_pendientes": sin_decision,
+                "instruccion": (
+                    "Por cada duplicado, pregunta al usuario: ¿DUPLICAR igual u OMITIR? "
+                    "(ofrece esas opciones y un atajo 'duplicar todas' / 'omitir todas'). "
+                    "Vuelve a llamar con confirm=true y duplicate_decisions "
+                    '(ej: {"WF-001": "duplicar"}).'
+                ),
+            })
+
+        dup_keys = {d["workflow_key"] for d in duplicados}
+        sv_cache: dict = {}
+        creados, omitidos, fallidos = [], [], []
+
+        for wf in workflows:
+            key = wf.get("workflow_key")
+            try:
+                if key in dup_keys and decisions.get(key) == "omitir":
+                    omitidos.append({"workflow_key": key, "subject": wf.get("subject")})
+                    continue
+
+                sid = wf["scenario_id"]
+                if sid not in sv_cache:
+                    sv_cache[sid] = _scenario_version(client, sid)
+
+                xml = build_workflow_xml(
+                    scenario_id      = sid,
+                    scenario_version = sv_cache[sid],
+                    subject          = wf["subject"],
+                    description      = wf.get("description", ""),
+                    valid_from       = wf["valid_from"],
+                    valid_to         = wf.get("valid_to", ""),
+                    start_conditions = wf.get("start_conditions") or [],
+                )
+                for st in (wf.get("steps") or []):
+                    principal = st.get("principal") or {}
+                    xml = add_activity(
+                        xml,
+                        name               = st["name"],
+                        principals         = [{"id": principal.get("id"), "type": principal.get("type", "USER")}],
+                        amount_min         = st.get("amount_min"),
+                        amount_max         = st.get("amount_max"),
+                        currency           = st.get("currency", "CLP"),
+                        step_id            = st.get("step_id"),
+                        is_optional        = str(st.get("is_optional", "1")),
+                        exclude_requestors = str(st.get("exclude_requestors", "2")),
+                    )
+
+                new_id = client.create_workflow(xml)
+                creados.append({
+                    "workflow_key":  key,
+                    "new_draft_id":  new_id,
+                    "subject":       wf.get("subject"),
+                    "pasos":         len(wf.get("steps") or []),
+                    "duplicado":     key in dup_keys,
+                })
+            except Exception as e:
+                logger.exception(f"Error creando workflow '{key}' del batch")
+                fallidos.append({"workflow_key": key, "subject": wf.get("subject"), "error": str(e)})
+
+        return ok({
+            "status":  "ejecutado",
+            "resumen": {
+                "creados":   len(creados),
+                "omitidos":  len(omitidos),
+                "fallidos":  len(fallidos),
+            },
+            "creados":                 creados,
+            "omitidos_por_duplicado":  omitidos,
+            "fallidos":                fallidos,
+            "borradores_creados":      [c["new_draft_id"] for c in creados],
+            "siguiente_paso": (
+                "Borradores creados en DRAFT. Revísalos en Fiori (F2190). Para activarlos, "
+                "consulta al usuario si activar TODO, NADA o PARCIAL y llama a "
+                "activate_workflows_batch con los WorkflowIds elegidos."
+            ),
+        })
+
+    # ── activate_workflows_batch ──────────────────────────────────────────────
+    elif name == "activate_workflows_batch":
+        workflow_ids = args.get("workflow_ids") or []
+        if not workflow_ids:
+            return err("No se recibieron workflow_ids para activar.")
+
+        activados, fallidos = [], []
+        for wid in workflow_ids:
+            try:
+                data = client.post_function("ActivateWorkflow", {"WorkflowId": f"'{wid}'"})
+                result = data.get("d", data)
+                activados.append({"workflow_id": wid, "status": result.get("Status", "ACTIVE")})
+            except Exception as e:
+                logger.exception(f"Error activando workflow '{wid}' del batch")
+                fallidos.append({"workflow_id": wid, "error": str(e)})
+
+        return ok({
+            "status":    "activacion_ejecutada",
+            "resumen":   {"activados": len(activados), "fallidos": len(fallidos)},
+            "activados": activados,
+            "fallidos":  fallidos,
         })
 
     else:
