@@ -638,3 +638,105 @@ def _reorder_workflow_children(root: ET.Element):
         root.remove(child)
     for child in children:
         root.append(child)
+
+
+# ── Construcción de workflow completo (para carga batch) ─────────────────────────
+
+def build_workflow_xml(
+    scenario_id: str,
+    scenario_version: str,
+    subject: str,
+    description: str = "",
+    valid_from: str = "",
+    valid_to: str = "",
+    start_conditions: Optional[list] = None,
+) -> str:
+    """
+    Construye el XML base de un workflow (cabecera + startConditions + processFlow
+    vacío) listo para POST /Workflows. Los pasos se agregan luego con add_activity.
+
+    Se usa ElementTree (no f-strings) para escapar correctamente subjects/valores.
+
+    start_conditions: lista de dicts {condition_id, parameters: {nombre: valor}}.
+    """
+    root = ET.Element("workflow", {
+        "id": "",
+        "formatVersion": "3.0",
+        "originalLanguage": "ES",
+        "targetLanguage": "ES",
+        "originalLanguageText": "Español",
+    })
+    ET.SubElement(root, "scenario").text = scenario_id
+    ET.SubElement(root, "scenarioVersion").text = scenario_version
+    ET.SubElement(root, "subject").text = subject
+    if description:
+        ET.SubElement(root, "description").text = description
+    ET.SubElement(root, "validFrom").text = valid_from
+    if valid_to:
+        ET.SubElement(root, "validTo").text = valid_to
+
+    if start_conditions:
+        sc_el = ET.SubElement(root, "startConditions")
+        for cond in start_conditions:
+            c = ET.SubElement(sc_el, "condition")
+            c.set("id", cond.get("condition_id", ""))
+            pv = ET.SubElement(c, "parameterValues")
+            for k, v in (cond.get("parameters") or {}).items():
+                _add_pv(pv, k, str(v))
+
+    ET.SubElement(root, "processFlow", {"artifactId": "80000000"})
+    return ET.tostring(root, encoding="unicode", xml_declaration=True)
+
+
+# ── Catálogo del escenario (parametrización / resolución negocio→técnico) ────────
+
+def parse_scenario_catalog(xml_text: str) -> dict:
+    """
+    Parseo best-effort de la definición de un escenario (scenarioDefinition que
+    devuelve el FunctionImport CreateWorkflow).
+
+    El esquema exacto depende de la versión de SAP, por lo que se extraen de forma
+    genérica todos los elementos con atributo 'id' agrupados por su tag (condiciones,
+    pasos, reglas, etc.) más el XML crudo para inspección. Sirve para que la capa de
+    resolución mapee términos de negocio a códigos técnicos sin hardcodear nada.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        return {"error": f"No se pudo parsear la definición del escenario: {e}",
+                "raw_xml": xml_text[:4000]}
+
+    def _strip_ns(tag: str) -> str:
+        return tag.split("}", 1)[1] if "}" in tag else tag
+
+    scenario = ""
+    scenario_version = ""
+    elementos_por_tipo: dict = {}
+
+    for el in root.iter():
+        tag = _strip_ns(el.tag)
+        if tag == "scenario" and not scenario and el.text:
+            scenario = el.text.strip()
+        if tag == "scenarioVersion" and not scenario_version and el.text:
+            scenario_version = el.text.strip()
+
+        el_id = el.get("id")
+        if el_id:
+            label = el.get("name") or el.get("text") or (el.text.strip() if el.text else "")
+            entry = {"id": el_id}
+            if label:
+                entry["label"] = label
+            bucket = elementos_por_tipo.setdefault(tag, [])
+            if entry not in bucket:
+                bucket.append(entry)
+
+    return {
+        "scenario": scenario,
+        "scenario_version": scenario_version,
+        "elementos_por_tipo": elementos_por_tipo,
+        "nota": (
+            "Parseo genérico best-effort; el esquema exacto depende de la versión de "
+            "SAP. Si falta algo, usa 'raw_xml' para inspeccionar la definición completa."
+        ),
+        "raw_xml": xml_text,
+    }
